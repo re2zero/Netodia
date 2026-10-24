@@ -90,6 +90,7 @@ fn install_account_refresher(ui: &AppWindow, state: &AppState, playlists_ui: &Ar
                 let detail = ui.global::<PlaylistDetail>();
                 detail.set_playlist_id(-1);
                 detail.set_cloud_collection(false);
+                detail.set_loading(false);
                 clear_vec_model::<UiTrackListRow>(
                     &detail.get_tracks(),
                     "playlists: clear account detail",

@@ -126,6 +126,9 @@ export global PlaylistDetail {
     in-out property <int> playlist-id: -1;
     // See `AlbumDetail.restoring`.
     in-out property <bool> restoring: false;
+    // Set from the click until the track list lands: the header the grid already held is up and
+    // the rows are still coming. Cleared by the fetch's own hop, and by a close.
+    in-out property <bool> loading: false;
     in-out property <PlaylistRow> playlist;
     in-out property <[TrackListRow]> tracks;
     in-out property <bool> cloud-collection: false;

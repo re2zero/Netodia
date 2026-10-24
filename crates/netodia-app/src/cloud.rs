@@ -5,9 +5,12 @@
 
 use std::collections::HashSet;
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
+use lru::LruCache;
 use netodia_core::entities::cloud::{
     Account, Album, Artist, DAILY_PLAYLIST_ID, LikedSong, Lyrics, MusicLibraryCategory, Playlist,
     Quality, RecentSong, RoamingMode, SearchKind, SearchResult, Song, StreamTicket,
@@ -22,8 +25,26 @@ const KEYRING_SERVICE: &str = "Netodia";
 const KEYRING_USER: &str = "netease-session";
 const SESSION_VERSION: u8 = 1;
 const COVER_SIZE: &str = "512y512";
+/// How long a fetched playlist may be reopened without another round trip. Long enough to make
+/// flipping between two playlists free, short enough that a list edited on another device shows up
+/// on its own.
+const PLAYLIST_CACHE_TTL: Duration = Duration::from_mins(5);
+/// An entry is a whole track list — roughly a megabyte for a thousand songs — so a few, not a stack.
+const PLAYLIST_CACHE_CAP: NonZeroUsize = match NonZeroUsize::new(4) {
+    Some(cap) => cap,
+    None => panic!("PLAYLIST_CACHE_CAP > 0"),
+};
 type LikedIdsCache = Arc<parking_lot::RwLock<Option<(i64, u64, HashSet<i64>)>>>;
 type RecentSongsCache = Arc<parking_lot::RwLock<Option<(i64, u64, Vec<RecentSong>)>>>;
+/// `(account, generation, playlist id)` → when it was fetched, and the response itself.
+type PlaylistCache =
+    Arc<parking_lot::Mutex<LruCache<(i64, u64, i64), (Instant, (Playlist, Vec<Song>))>>>;
+
+/// Whether a cached playlist is still worth serving. Pure, so both sides of the TTL boundary are
+/// table-testable without a clock to steer.
+fn playlist_cache_is_fresh(fetched_at: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(fetched_at) < PLAYLIST_CACHE_TTL
+}
 
 /// QR sign-in progress exposed to the application and view layers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -85,6 +106,7 @@ pub struct CloudService {
     liked_ids_cache: LikedIdsCache,
     liked_ids_revision: Arc<AtomicU64>,
     recent_songs_cache: RecentSongsCache,
+    playlist_cache: PlaylistCache,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -135,6 +157,7 @@ impl CloudService {
             liked_ids_cache: Arc::new(parking_lot::RwLock::new(None)),
             liked_ids_revision: Arc::new(AtomicU64::new(0)),
             recent_songs_cache: Arc::new(parking_lot::RwLock::new(None)),
+            playlist_cache: Arc::new(parking_lot::Mutex::new(LruCache::new(PLAYLIST_CACHE_CAP))),
         }
     }
 
@@ -196,10 +219,56 @@ impl CloudService {
     }
 
     /// Load a signed-in user's saved playlist and its tracks under one account generation.
+    ///
+    /// A playlist is the one cloud response big enough that a re-open is worth avoiding: its
+    /// track list costs a round trip plus one per 300 songs, so flipping back to a list you just
+    /// looked at pays that again. The cache is keyed by account *and* generation, and cleared on
+    /// every transition, so a stale entry can't outlive the session that fetched it.
     pub async fn saved_playlist(&self, id: i64) -> AppResult<(Playlist, Vec<Song>)> {
         validate_id("歌单", id)?;
-        let (_account, cancellation) = self.account_snapshot()?;
-        self.account_request_in_generation(self.client.playlist(id), cancellation).await
+        let (account, cancellation) = self.account_snapshot()?;
+        let generation = self.status().generation;
+        if let Some(cached) = self.cached_playlist(account.id, generation, id) {
+            return Ok(cached);
+        }
+        let loaded =
+            self.account_request_in_generation(self.client.playlist(id), cancellation).await?;
+        self.store_playlist(account.id, generation, id, &loaded);
+        Ok(loaded)
+    }
+
+    fn cached_playlist(
+        &self,
+        account_id: i64,
+        generation: u64,
+        playlist_id: i64,
+    ) -> Option<(Playlist, Vec<Song>)> {
+        let key = (account_id, generation, playlist_id);
+        let mut cache = self.playlist_cache.lock();
+        match cache.peek(&key).map(|(at, _)| *at) {
+            Some(at) if playlist_cache_is_fresh(at, Instant::now()) => {
+                cache.get(&key).map(|(_, loaded)| (loaded.0.clone(), loaded.1.clone()))
+            }
+            Some(_) => {
+                cache.pop(&key);
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Stored under the generation the *fetch* ran in, never the one current at this instant: a
+    /// sign-in that lands between the two would otherwise file an old session's track list under
+    /// the new one, and the next read would serve it.
+    fn store_playlist(
+        &self,
+        account_id: i64,
+        generation: u64,
+        playlist_id: i64,
+        loaded: &(Playlist, Vec<Song>),
+    ) {
+        let key = (account_id, generation, playlist_id);
+        self.playlist_cache.lock().put(key, (Instant::now(), loaded.clone()));
     }
 
     pub async fn album(&self, id: i64) -> AppResult<(Album, Vec<Song>)> {
@@ -422,6 +491,18 @@ impl CloudService {
         let (cached_account, generation, ids) = cache.as_ref()?;
         (*cached_account == account_id && *generation == status.generation)
             .then(|| ids.contains(&song_id))
+    }
+
+    /// The whole liked set this process already holds for the visible account, or `None` when it
+    /// was never fetched (or belongs to a previous account or generation). A view flagging every
+    /// row of a list is the caller that needs the set rather than one membership answer, and a
+    /// list open is not worth a second whole-list request when the snapshot is already there.
+    pub fn cached_liked_ids(&self) -> Option<HashSet<i64>> {
+        let status = self.status();
+        let account_id = status.account?.id;
+        let cache = self.liked_ids_cache.read();
+        let (cached_account, generation, ids) = cache.as_ref()?;
+        (*cached_account == account_id && *generation == status.generation).then(|| ids.clone())
     }
 
     /// Version of the liked-song snapshot. Views use it to discard a read that raced a successful
@@ -681,6 +762,7 @@ impl CloudService {
         self.liked_ids_revision.fetch_add(1, Ordering::AcqRel);
         *self.liked_ids_cache.write() = None;
         *self.recent_songs_cache.write() = None;
+        self.playlist_cache.lock().clear();
         self.publish(None, None, self.status().remember_available);
         *self.account_tasks.write() = CancellationToken::new();
         self.client.clear_session().await;
@@ -836,6 +918,7 @@ mod tests {
             liked_ids_cache: Arc::new(parking_lot::RwLock::new(None)),
             liked_ids_revision: Arc::new(AtomicU64::new(0)),
             recent_songs_cache: Arc::new(parking_lot::RwLock::new(None)),
+            playlist_cache: Arc::new(parking_lot::Mutex::new(LruCache::new(PLAYLIST_CACHE_CAP))),
         }
     }
 
@@ -951,6 +1034,33 @@ mod tests {
         service.begin_transition().await;
 
         assert!(service.liked_ids_cache.read().is_none());
+    }
+
+    #[test]
+    fn a_playlist_cache_entry_is_scoped_to_account_generation_and_playlist() {
+        let service = service_for_test();
+        service.status.send_replace(SessionStatus {
+            account: Some(Account { id: 42, ..Account::default() }),
+            generation: 7,
+            ..SessionStatus::default()
+        });
+        let loaded = (Playlist { id: 500, ..Playlist::default() }, Vec::new());
+        service.store_playlist(42, 7, 500, &loaded);
+
+        assert!(service.cached_playlist(42, 7, 500).is_some());
+        // Another account, another generation, or another playlist: all misses.
+        assert!(service.cached_playlist(43, 7, 500).is_none());
+        assert!(service.cached_playlist(42, 8, 500).is_none());
+        assert!(service.cached_playlist(42, 7, 501).is_none());
+    }
+
+    #[test]
+    fn a_cached_playlist_stops_being_served_at_the_ttl() {
+        let fetched = Instant::now();
+        let inside = PLAYLIST_CACHE_TTL.saturating_sub(Duration::from_millis(1));
+        assert!(playlist_cache_is_fresh(fetched, fetched));
+        assert!(playlist_cache_is_fresh(fetched, fetched + inside));
+        assert!(!playlist_cache_is_fresh(fetched, fetched + PLAYLIST_CACHE_TTL));
     }
 
     #[test]

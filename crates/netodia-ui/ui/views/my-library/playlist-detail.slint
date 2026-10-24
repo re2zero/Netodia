@@ -105,10 +105,20 @@ export component PlaylistDetailBody inherits Rectangle {
                 : @tr("Drag music files here, or add tracks via any track's overflow menu.");
         }
 
-        if PlaylistDetail.playlist.track_count == 0 && PlaylistDetail.cloud-collection: GridEmptyState {
+        if PlaylistDetail.playlist.track_count == 0 && PlaylistDetail.cloud-collection && !PlaylistDetail.loading: GridEmptyState {
             icon: "music_note";
             title: @tr("No tracks yet");
             body: @tr("This NetEase playlist has no available tracks.");
+        }
+
+        // The rows are still coming: the header above is the grid card's facts, so the list says
+        // what it is waiting for rather than showing the empty state it would show for a playlist
+        // that really has nothing in it. Cleared past the column band, which stays visible.
+        if PlaylistDetail.loading: Text {
+            x: Theme.pad-lg;
+            y: Theme.track-header-h + Theme.pad-xs + Theme.pad-md;
+            text: @tr("Loading…");
+            color: Theme.subtext0;
         }
 
         // OS file-hover banner — routed here when the queue sheet is closed and this

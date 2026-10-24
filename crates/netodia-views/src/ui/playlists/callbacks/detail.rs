@@ -83,6 +83,9 @@ fn wire_close(ui: &AppWindow, state: &AppState, playlists_ui: &Arc<PlaylistsUi>)
         let Some(ui) = weak.upgrade() else { return };
         pu.detail_request.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         ui.global::<PlaylistDetail>().set_cloud_collection(false);
+        // A close can land on a header whose rows never arrived, and the next open repaints this
+        // anyway — leaving it set would make the grid's next owner show the loading line.
+        ui.global::<PlaylistDetail>().set_loading(false);
         track_detail::forget_closed(&ui, &s, &*pu, &ui.global::<PlaylistDetail>());
 
         let pu = pu.clone();

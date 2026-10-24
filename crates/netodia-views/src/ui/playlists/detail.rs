@@ -2,7 +2,7 @@
 //! plus a `"position"` sort that rebuilds the display order from the canonical position-order
 //! cache instead of re-fetching. What the four details share is [`crate::ui::track_detail`].
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -67,9 +67,15 @@ async fn fetch_playlist_detail(
     playlists_ui: &PlaylistsUi,
     playlist_id: i64,
 ) -> AppResult<(PlaylistStats, Vec<RsTrackListRow>)> {
-    let ((playlist, songs), liked_ids) =
-        tokio::try_join!(state.cloud.library_playlist(playlist_id), state.cloud.liked_ids(),)?;
-    let liked_ids: HashSet<i64> = liked_ids.into_iter().collect();
+    let playlist_request = state.cloud.library_playlist(playlist_id);
+    // The liked set is a whole-list fetch and every row's heart reads the same snapshot through
+    // `cached_is_liked`, so only the first detail opened in an account session owes the request.
+    let ((playlist, songs), liked_ids) = if let Some(cached) = state.cloud.cached_liked_ids() {
+        (playlist_request.await?, cached)
+    } else {
+        let (loaded, ids) = tokio::try_join!(playlist_request, state.cloud.liked_ids())?;
+        (loaded, ids.into_iter().collect())
+    };
     let thumbnail_path =
         playlists_ui.grid_stats_by_id(playlist_id).and_then(|stats| stats.thumbnail_path);
     let detail = cloud_playlist_stats(playlist, thumbnail_path, &songs);
@@ -173,7 +179,31 @@ where
 {
     let account_generation = state.cloud.status().generation;
     let request = playlists_ui.detail_request.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
-    let (detail, mut tracks) = fetch_playlist_detail(state, playlists_ui, playlist_id).await?;
+    let pending = seat_pending_header(
+        state,
+        playlists_ui,
+        &weak,
+        playlist_id,
+        enter_from,
+        request,
+        account_generation,
+    );
+    let (detail, mut tracks) = match fetch_playlist_detail(state, playlists_ui, playlist_id).await {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            if pending {
+                abandon_pending(
+                    state,
+                    playlists_ui,
+                    &weak,
+                    playlist_id,
+                    request,
+                    account_generation,
+                );
+            }
+            return Err(error);
+        }
+    };
 
     // `fetch_playlist_detail` returns tracks in playlist position order — capture that as the
     // canonical `position_order` before applying the persisted detail sort. `position` is the
@@ -225,6 +255,7 @@ where
         let header = to_slint_playlist_row(&detail);
         g.set_playlist(header);
         g.set_cloud_collection(true);
+        g.set_loading(false);
         filter::install_tracks(&g, ui_tracks);
         selection::reset(&g, &playlists_ui.detail.cache);
         // Fresh open clears the filter so the user lands on the full track set, not a stale needle
@@ -254,6 +285,94 @@ where
         ui.global::<netodia_ui::MyLibrary>().invoke_detail_scope_changed();
     });
     Ok(())
+}
+
+/// Paint the header the grid already holds and flip to the detail **before** the track list is
+/// fetched, so the click's answer is the surface changing rather than a grid sitting still for
+/// as long as the request takes — one round trip plus one per 300 songs.
+///
+/// Returns whether a paint was queued, which is [`abandon_pending`]'s cue. Everything a pending
+/// frame cannot know stays in [`open_playlist_with`]'s own hop: the chips, the decoded
+/// `(cover, blur)` pair, the history entry and the drop target. The cover is the row tier's
+/// already-decoded thumbnail — the card this click came from drew it — because a real decode here
+/// would block the very frame that exists to arrive early.
+fn seat_pending_header(
+    state: &AppState,
+    playlists_ui: &Arc<PlaylistsUi>,
+    weak: &Weak<AppWindow>,
+    playlist_id: i64,
+    enter_from: NavEnterFrom,
+    request: u64,
+    account_generation: u64,
+) -> bool {
+    if playlists_ui.grid_stats_by_id(playlist_id).is_none() {
+        return false;
+    }
+    let playlists_ui = playlists_ui.clone();
+    let cloud = state.cloud.clone();
+    let _ = weak.upgrade_in_event_loop(move |ui| {
+        if cloud.status().generation != account_generation
+            || playlists_ui.detail_request.load(Ordering::Acquire) != request
+        {
+            return;
+        }
+        // Asked again on this side: the grid can be wiped between the click and this tick.
+        let Some(stats) = playlists_ui.grid_stats_by_id(playlist_id) else {
+            return;
+        };
+        let g = ui.global::<PlaylistDetail>();
+        // The caches go before the properties, so a callback firing on the pending frame reads
+        // the playlist it is looking at rather than the one before it.
+        playlists_ui.detail.cache.release_rows();
+        playlists_ui.detail.cache.set_id(playlist_id);
+        playlists_ui.detail.position_order.lock().clear();
+        filter::install_tracks(&g, Vec::new());
+        selection::reset(&g, &playlists_ui.detail.cache);
+        g.set_cover(playlists_ui.pending_cover(stats.thumbnail_path.as_deref()));
+        g.set_playlist(to_slint_playlist_row(&stats));
+        g.set_cloud_collection(true);
+        // Fresh-open semantics, same as the filled-in hop: no needle from the previous detail.
+        g.set_filter(SharedString::default());
+        g.set_loading(true);
+        // The band is about to paint a title it has no counts for; a previous playlist's chips
+        // under it would be a lie. The fetch republishes both.
+        crate::ui::hero_chips::clear(&ui);
+        crate::ui::nav_transition::mark(&ui, enter_from);
+        g.set_playlist_id(clamp_i64_to_i32(playlist_id));
+        ui.global::<netodia_ui::MyLibrary>().invoke_detail_scope_changed();
+    });
+    true
+}
+
+/// Hand the grid back when the fetch behind a pending header fails: the click before it left the
+/// grid standing, and a header with no rows and no way out would be worse than that.
+///
+/// Guarded on the request counter, so a newer click's pending frame is never torn down by an
+/// older fetch's failure.
+fn abandon_pending(
+    state: &AppState,
+    playlists_ui: &Arc<PlaylistsUi>,
+    weak: &Weak<AppWindow>,
+    playlist_id: i64,
+    request: u64,
+    account_generation: u64,
+) {
+    let playlists_ui = playlists_ui.clone();
+    let cloud = state.cloud.clone();
+    let _ = weak.upgrade_in_event_loop(move |ui| {
+        if cloud.status().generation != account_generation
+            || playlists_ui.detail_request.load(Ordering::Acquire) != request
+            || playlists_ui.detail.cache.id() != playlist_id
+        {
+            return;
+        }
+        playlists_ui.detail.cache.clear();
+        let g = ui.global::<PlaylistDetail>();
+        filter::install_tracks(&g, Vec::new());
+        g.set_loading(false);
+        g.set_cloud_collection(false);
+        g.set_playlist_id(-1);
+    });
 }
 
 /// Re-fetch an already-open playlist's header + tracks after a library change or a CRUD operation,
@@ -311,6 +430,7 @@ pub async fn refresh_detail(
         selection::prune_selection_to(&g, &tracks);
         playlists_ui.detail.cache.set_all_tracks(tracks);
         *playlists_ui.detail.position_order.lock() = position_order_snapshot;
+        g.set_loading(false);
         apply_filtered_detail(&g, &playlists_ui);
     });
     Ok(())

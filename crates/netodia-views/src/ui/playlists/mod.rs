@@ -242,6 +242,14 @@ impl PlaylistsUi {
     pub fn row_cover(&self, artwork_path: &str) -> slint::Image {
         self.cover_thumbs.get_or_load_opt(Some(artwork_path).filter(|s| !s.is_empty()))
     }
+
+    /// Cache-only cover lookup for a detail header painted before its fetch starts. The tier is
+    /// the one the grid card drew from, so this is a hit for every card the user could have
+    /// clicked; a miss serves the placeholder rather than decoding on the frame that exists to
+    /// arrive early.
+    pub fn pending_cover(&self, artwork_path: Option<&str>) -> slint::Image {
+        self.cover_thumbs.get_cached_opt(artwork_path)
+    }
 }
 
 /// Build the empty `VecModel`s the Playlists grid (chunked + flat),

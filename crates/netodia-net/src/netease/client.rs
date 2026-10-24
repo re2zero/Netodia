@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use futures_util::{StreamExt as _, TryStreamExt as _};
 use netodia_core::entities::cloud::{
     Account, Album, Artist, LikedSong, Lyrics, Playlist, Quality, RecentSong, SearchKind,
     SearchResult, Song, StreamTicket,
@@ -25,6 +26,12 @@ const EAPI_UA: &str = "NeteaseMusic 9.0.90/5038 (iPhone; iOS 16.2; zh_CN)";
 const DESKTOP_APPVER: &str = "3.1.17.204416";
 const DESKTOP_OSVER: &str = "Microsoft-Windows-10-Professional-build-19045-64bit";
 const MAX_JSON: u64 = 16 * 1024 * 1024;
+/// Song ids per `song/detail` request. The route takes a much longer list, but a batch this size
+/// keeps one response small enough to parse without a noticeable pause on the UI-facing hop.
+const SONG_BATCH: usize = 300;
+/// How many `song/detail` batches may be in flight at once. The route publishes no rate limit and
+/// a playlist open is the only caller that asks for more than one or two.
+const SONG_BATCH_CONCURRENCY: usize = 3;
 
 fn request_profile(
     protocol: Protocol,
@@ -493,30 +500,45 @@ impl Client {
     }
 
     pub async fn songs(&self, ids: &[i64]) -> Result<Vec<Song>> {
-        let mut all = Vec::new();
-        for batch in ids.chunks(300) {
-            let c = batch.iter().map(|id| json!({"id":id})).collect::<Vec<_>>();
-            let body = self
-                .request(
-                    ep::SONGS,
-                    json!({"c":serde_json::to_string(&c).map_err(|_|Error::InvalidResponse)?}),
-                )
-                .await?;
-            let mut songs: Vec<Song> = field(body.clone(), "songs")?;
-            let privileges: Vec<netodia_core::entities::cloud::Privilege> =
-                field(body, "privileges").unwrap_or_default();
-            for song in &mut songs {
-                song.privilege = privileges.iter().find(|p| p.id == song.id).cloned();
-            }
-            // Detail responses may reorder IDs; restore the caller's order and preserve repeated
-            // entries (playlists can contain the same song more than once).
-            all.extend(reorder_songs(batch, songs));
+        // Owned batches rather than borrowed ones: an async block over a `&[i64]` makes this
+        // future's type depend on one slice lifetime, which callers spawning it can't satisfy.
+        let batches = ids.chunks(SONG_BATCH).map(<[i64]>::to_vec).collect::<Vec<_>>();
+        let fetched: Vec<Vec<Song>> = futures_util::stream::iter(batches)
+            .map(|batch| self.song_batch(batch))
+            // A playlist open is the one caller that pays for more than a batch or two, and the
+            // batches are independent: sequentially, a 600-track playlist waits out two round
+            // trips for no ordering benefit. `buffered` keeps them in playlist order however they
+            // interleave.
+            .buffered(SONG_BATCH_CONCURRENCY)
+            .try_collect()
+            .await?;
+        Ok(fetched.into_iter().flatten().collect())
+    }
+
+    async fn song_batch(&self, ids: Vec<i64>) -> Result<Vec<Song>> {
+        let c = ids.iter().map(|id| json!({"id":id})).collect::<Vec<_>>();
+        let body = self
+            .request(
+                ep::SONGS,
+                json!({"c":serde_json::to_string(&c).map_err(|_|Error::InvalidResponse)?}),
+            )
+            .await?;
+        let mut songs: Vec<Song> = field(body.clone(), "songs")?;
+        let privileges: Vec<netodia_core::entities::cloud::Privilege> =
+            field(body, "privileges").unwrap_or_default();
+        for song in &mut songs {
+            song.privilege = privileges.iter().find(|p| p.id == song.id).cloned();
         }
-        Ok(all)
+        // Detail responses may reorder IDs; restore the caller's order and preserve repeated
+        // entries (playlists can contain the same song more than once).
+        Ok(reorder_songs(&ids, songs))
     }
 
     pub async fn playlist(&self, id: i64) -> Result<(Playlist, Vec<Song>)> {
-        let body = self.request(ep::PLAYLIST, json!({"id":id,"n":100_000,"s":0})).await?;
+        // `n` is how many tracks this response inlines. Nothing here reads them — the rows come
+        // from `songs` below — and a non-zero `n` makes the header carry a second copy of the
+        // whole playlist, its payload growing with the track count.
+        let body = self.request(ep::PLAYLIST, json!({"id":id,"n":0,"s":0})).await?;
         let playlist = decode_playlist_header(&body, id)?;
         let ids = body["playlist"]["trackIds"]
             .as_array()
